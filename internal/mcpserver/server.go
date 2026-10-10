@@ -188,7 +188,9 @@ func (s *Server) Start() {
 func (s *Server) updateResources() {
 	s.addResources()
 
-	ticker := time.NewTicker(1 * time.Minute)
+	// Refresh rarely: every running instance re-fetches every recipe, and
+	// hammering paprikaapp.com gets our IP's connections reset (including login).
+	ticker := time.NewTicker(30 * time.Minute)
 	for range ticker.C {
 		s.addResources()
 	}
@@ -248,10 +250,13 @@ func (s *Server) addRecipeResource(uid string) error {
 }
 
 func (s *Server) addResourcesConcurrently(recipes *paprika.RecipeList) {
-	buffer := make(chan struct{}, 10)
+	buffer := make(chan struct{}, 3)
+	var wg sync.WaitGroup
 
 	for _, r := range recipes.Result {
+		wg.Add(1)
 		go func() (err error) {
+			defer wg.Done()
 			buffer <- struct{}{}
 			defer func() {
 				<-buffer
@@ -266,6 +271,7 @@ func (s *Server) addResourcesConcurrently(recipes *paprika.RecipeList) {
 			return s.addRecipeResource(r.UID)
 		}()
 	}
+	wg.Wait()
 }
 
 func (s *Server) createRecipe(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

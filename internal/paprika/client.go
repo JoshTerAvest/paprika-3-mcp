@@ -127,9 +127,21 @@ func NewClient(username, password, version string, logger *slog.Logger) (*Client
 		Timeout:   10 * time.Second,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	token, err := login(ctx, *client, username, password)
+	// Retry login: paprikaapp.com intermittently resets connections.
+	var token string
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		token, err = login(ctx, *client, username, password)
+		cancel()
+		if err == nil {
+			break
+		}
+		logger.Warn("login attempt failed", "attempt", attempt, "err", err)
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to login: %w", err)
 	}
