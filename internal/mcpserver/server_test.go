@@ -191,11 +191,12 @@ func TestListMealPlan_DateFiltering(t *testing.T) {
 func TestListGroceries_PurchaseFilter(t *testing.T) {
 	mock := &mockClient{
 		groceries: []paprika.GroceryItem{
-			{UID: "1", Ingredient: "Milk", Purchased: false, Aisle: "Dairy"},
-			{UID: "2", Ingredient: "Eggs", Purchased: true, Aisle: "Dairy"},
-			{UID: "3", Ingredient: "Bread", Purchased: false, Aisle: "Bakery"},
-			{UID: "4", Ingredient: "Deleted Item", Purchased: false, Deleted: true},
+			{UID: "1", Ingredient: "Milk", Purchased: false, Aisle: "Dairy", ListUID: "L1"},
+			{UID: "2", Ingredient: "Eggs", Purchased: true, Aisle: "Dairy", ListUID: "L1"},
+			{UID: "3", Ingredient: "Bread", Purchased: false, Aisle: "Bakery", ListUID: "L1"},
+			{UID: "4", Ingredient: "Deleted Item", Purchased: false, Deleted: true, ListUID: "L1"},
 		},
+		groceryLists: []paprika.GroceryList{{UID: "L1", Name: "My List", IsDefault: true}},
 	}
 	s := newTestServer(mock)
 	ctx := context.Background()
@@ -256,8 +257,9 @@ func TestListGroceries_PurchaseFilter(t *testing.T) {
 	t.Run("items without aisle grouped under Other", func(t *testing.T) {
 		mockWithNoAisle := &mockClient{
 			groceries: []paprika.GroceryItem{
-				{UID: "1", Ingredient: "Mystery Item", Aisle: ""},
+				{UID: "1", Ingredient: "Mystery Item", Aisle: "", ListUID: "L1"},
 			},
+			groceryLists: []paprika.GroceryList{{UID: "L1", Name: "My List", IsDefault: true}},
 		}
 		s2 := newTestServer(mockWithNoAisle)
 		result, err := s2.listGroceries(ctx, callToolRequest(map[string]interface{}{}))
@@ -415,16 +417,33 @@ func TestRemoveGroceryItem(t *testing.T) {
 		assert.Equal(t, []string{"3"}, mock.deletedGroceryUIDs)
 	})
 
-	t.Run("partial match finds items", func(t *testing.T) {
+	t.Run("ambiguous name is refused and lists uids", func(t *testing.T) {
 		mock.deletedGroceryUIDs = nil
 		result, err := s.removeGroceryItem(ctx, callToolRequest(map[string]interface{}{
 			"item_name": "milk",
 		}))
 		require.NoError(t, err)
 		text := result.Content[0].(mcp.TextContent).Text
-		// Should remove first match (Whole Milk) and report both
-		assert.Contains(t, text, "Found 2 items matching")
-		assert.Equal(t, []string{"1"}, mock.deletedGroceryUIDs)
+		assert.Contains(t, text, "Multiple Items Match")
+		assert.Contains(t, text, "uid: 1")
+		assert.Contains(t, text, "uid: 2")
+		assert.Empty(t, mock.deletedGroceryUIDs)
+	})
+
+	t.Run("uid removes that exact item", func(t *testing.T) {
+		mock.deletedGroceryUIDs = nil
+		result, err := s.removeGroceryItem(ctx, callToolRequest(map[string]interface{}{
+			"uid": "2",
+		}))
+		require.NoError(t, err)
+		text := result.Content[0].(mcp.TextContent).Text
+		assert.Contains(t, text, "Removed **Almond Milk**")
+		assert.Equal(t, []string{"2"}, mock.deletedGroceryUIDs)
+	})
+
+	t.Run("requires uid or name", func(t *testing.T) {
+		_, err := s.removeGroceryItem(ctx, callToolRequest(map[string]interface{}{}))
+		assert.Error(t, err)
 	})
 
 	t.Run("no match returns message", func(t *testing.T) {
@@ -503,5 +522,104 @@ func TestDeleteRecipe(t *testing.T) {
 		}))
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to get recipe")
+	})
+}
+
+func TestListGroceries_ListSelection(t *testing.T) {
+	mock := &mockClient{
+		groceries: []paprika.GroceryItem{
+			{UID: "a", Ingredient: "Butter", ListUID: "L1"},
+			{UID: "b", Ingredient: "Paper Towels", ListUID: "L2"},
+			{UID: "c", Ingredient: "Crusty bread", ListUID: ""},
+			{UID: "d", Ingredient: "Canned peaches", ListUID: "GONE"},
+		},
+		groceryLists: []paprika.GroceryList{
+			{UID: "L1", Name: "My Grocery List", IsDefault: true},
+			{UID: "L2", Name: "Costco"},
+			{UID: "GONE", Name: "Old", Deleted: true},
+		},
+	}
+	s := newTestServer(mock)
+	ctx := context.Background()
+	text := func(args map[string]interface{}) string {
+		result, err := s.listGroceries(ctx, callToolRequest(args))
+		require.NoError(t, err)
+		return result.Content[0].(mcp.TextContent).Text
+	}
+
+	t.Run("defaults to the default list and hides orphans", func(t *testing.T) {
+		out := text(map[string]interface{}{})
+		assert.Contains(t, out, "# Grocery List: My Grocery List")
+		assert.Contains(t, out, "**Butter** — list: My Grocery List · uid: a")
+		assert.NotContains(t, out, "Paper Towels")
+		assert.NotContains(t, out, "Crusty bread")
+		assert.NotContains(t, out, "Canned peaches")
+	})
+
+	t.Run("selects a list by name", func(t *testing.T) {
+		out := text(map[string]interface{}{"list": "costco"})
+		assert.Contains(t, out, "Paper Towels")
+		assert.NotContains(t, out, "Butter")
+	})
+
+	t.Run("include_orphans labels items on no live list", func(t *testing.T) {
+		out := text(map[string]interface{}{"include_orphans": true})
+		assert.Contains(t, out, "Butter")
+		assert.Contains(t, out, "**Crusty bread** — list: (none — orphaned) · uid: c")
+		assert.Contains(t, out, "**Canned peaches** — list: (none — orphaned) · uid: d")
+		assert.NotContains(t, out, "Paper Towels")
+	})
+
+	t.Run("all shows every list and orphans", func(t *testing.T) {
+		out := text(map[string]interface{}{"list": "all"})
+		for _, name := range []string{"Butter", "Paper Towels", "Crusty bread", "Canned peaches"} {
+			assert.Contains(t, out, name)
+		}
+	})
+
+	t.Run("unknown list is an error", func(t *testing.T) {
+		_, err := s.listGroceries(ctx, callToolRequest(map[string]interface{}{"list": "Trader Joe's"}))
+		assert.Error(t, err)
+	})
+}
+
+func TestSetGroceryPurchased(t *testing.T) {
+	mock := &mockClient{
+		groceries: []paprika.GroceryItem{
+			{UID: "1", Ingredient: "Butter", Name: "Butter", ListUID: "L1", Aisle: "Dairy", Quantity: "1 lb"},
+			{UID: "2", Ingredient: "Butter", Name: "Butter", ListUID: "L1"},
+		},
+		groceryLists: []paprika.GroceryList{{UID: "L1", Name: "My Grocery List", IsDefault: true}},
+	}
+	s := newTestServer(mock)
+	ctx := context.Background()
+
+	t.Run("by uid saves the full item as purchased", func(t *testing.T) {
+		mock.savedGroceryItems = nil
+		result, err := s.setGroceryPurchased(ctx, callToolRequest(map[string]interface{}{"uid": "1"}))
+		require.NoError(t, err)
+		assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "as purchased")
+		require.Len(t, mock.savedGroceryItems, 1)
+		saved := mock.savedGroceryItems[0]
+		assert.True(t, saved.Purchased)
+		assert.Equal(t, "L1", saved.ListUID)
+		assert.Equal(t, "Dairy", saved.Aisle)
+		assert.Equal(t, "1 lb", saved.Quantity)
+	})
+
+	t.Run("purchased false unchecks", func(t *testing.T) {
+		mock.savedGroceryItems = nil
+		_, err := s.setGroceryPurchased(ctx, callToolRequest(map[string]interface{}{"uid": "1", "purchased": false}))
+		require.NoError(t, err)
+		require.Len(t, mock.savedGroceryItems, 1)
+		assert.False(t, mock.savedGroceryItems[0].Purchased)
+	})
+
+	t.Run("duplicate name is refused", func(t *testing.T) {
+		mock.savedGroceryItems = nil
+		result, err := s.setGroceryPurchased(ctx, callToolRequest(map[string]interface{}{"item_name": "butter"}))
+		require.NoError(t, err)
+		assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "Multiple Items Match")
+		assert.Empty(t, mock.savedGroceryItems)
 	})
 }

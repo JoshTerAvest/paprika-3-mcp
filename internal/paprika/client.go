@@ -68,7 +68,18 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err = t.transport.RoundTrip(req)
 		if err != nil {
-			return nil, err // network errors are not retried
+			// Retry network errors (connection resets, header timeouts):
+			// paprikaapp.com drops connections intermittently. Sync writes
+			// upsert by UID, so replaying a POST is safe.
+			if attempt == t.maxRetries {
+				return nil, err
+			}
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(t.baseDelay * (1 << attempt)):
+			}
+			continue
 		}
 
 		// Don't retry on success or client errors (except 429)

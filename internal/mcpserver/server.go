@@ -101,8 +101,10 @@ func (s *Server) Start() {
 		mcp.WithString("end_date", mcp.Description("Filter to meals on or before this date. Format: YYYY-MM-DD. If omitted, no upper bound is applied."), mcp.DefaultString("")),
 	)
 	listGroceriesTool := mcp.NewTool("list_groceries",
-		mcp.WithDescription("List grocery items across all grocery lists in Paprika. Items are grouped by aisle. Each item includes its list_uid indicating which grocery list it belongs to."),
+		mcp.WithDescription("List grocery items in Paprika, grouped by aisle. Defaults to the account's default grocery list. Each line shows the item's list name and UID; items whose list_uid matches no grocery list are labeled orphaned (the Paprika app does not show them)."),
 		mcp.WithString("filter", mcp.Description("Filter by purchase status: 'purchased', 'unpurchased', or 'all'"), mcp.DefaultString("all")),
+		mcp.WithString("list", mcp.Description("Grocery list name or UID, or 'all' for every list including orphaned items. Defaults to the default list."), mcp.DefaultString("")),
+		mcp.WithBoolean("include_orphans", mcp.Description("Also include orphaned items (attached to no existing list). Implied when list is 'all'."), mcp.DefaultBool(false)),
 	)
 	addMealTool := mcp.NewTool("add_meal_to_plan",
 		mcp.WithDescription("Add a meal to the Paprika meal plan calendar. A meal can optionally be linked to an existing recipe by providing its UID (use search_recipes to find recipe UIDs). Defaults to Dinner if no meal_type is specified."),
@@ -131,9 +133,16 @@ func (s *Server) Start() {
 		mcp.WithString("recipe", mcp.Description("Recipe this ingredient is for (optional)"), mcp.DefaultString("")),
 		mcp.WithString("instruction", mcp.Description("Special instructions (optional)"), mcp.DefaultString("")),
 	)
+	setGroceryPurchasedTool := mcp.NewTool("set_grocery_purchased",
+		mcp.WithDescription("Mark a grocery item as purchased (checked off) or not purchased. Identify the item by uid (preferred, from list_groceries) or by name. A name that matches more than one item is refused; pass the uid instead."),
+		mcp.WithString("uid", mcp.Description("UID of the grocery item, from list_groceries."), mcp.DefaultString("")),
+		mcp.WithString("item_name", mcp.Description("Name or partial name of the item, matched case-insensitively. Used only when uid is empty."), mcp.DefaultString("")),
+		mcp.WithBoolean("purchased", mcp.Description("true to check the item off, false to put it back on the to-buy list."), mcp.DefaultBool(true)),
+	)
 	removeGroceryItemTool := mcp.NewTool("remove_grocery_item",
-		mcp.WithDescription("Remove an item from a Paprika grocery list by name. Performs a case-insensitive search across ingredient and item names. If multiple items match, only the first match is removed and the others are reported. This is a soft delete."),
-		mcp.WithString("item_name", mcp.Description("Name or partial name of the item to remove. Searches ingredient and item names case-insensitively. Use list_groceries to see current items."), mcp.Required()),
+		mcp.WithDescription("Remove an item from a Paprika grocery list. Identify the item by uid (preferred, from list_groceries) or by name. A name that matches more than one item is refused; pass the uid instead. This is a soft delete."),
+		mcp.WithString("uid", mcp.Description("UID of the grocery item to remove, from list_groceries."), mcp.DefaultString("")),
+		mcp.WithString("item_name", mcp.Description("Name or partial name of the item to remove, matched case-insensitively against ingredient and item names. Used only when uid is empty."), mcp.DefaultString("")),
 	)
 	deleteRecipeTool := mcp.NewTool("delete_recipe",
 		mcp.WithDescription("Delete a recipe from Paprika by moving it to the trash (soft delete). The recipe can be recovered from the trash in the Paprika app. Use list_recipes or search_recipes to find the recipe UID."),
@@ -172,6 +181,9 @@ func (s *Server) Start() {
 	}, server.ServerTool{
 		Tool:    addGroceryItemTool,
 		Handler: s.addGroceryItem,
+	}, server.ServerTool{
+		Tool:    setGroceryPurchasedTool,
+		Handler: s.setGroceryPurchased,
 	}, server.ServerTool{
 		Tool:    removeGroceryItemTool,
 		Handler: s.removeGroceryItem,
@@ -689,72 +701,158 @@ func (s *Server) addGroceryItem(ctx context.Context, req mcp.CallToolRequest) (*
 	return mcp.NewToolResultText(resultText.String()), nil
 }
 
+// findGroceryItem returns the single live (non-deleted) grocery item matching
+// the request's uid, or else its case-insensitive item_name. When there is no
+// match or the name is ambiguous it returns a result to show the caller
+// instead, listing each candidate's UID, so nothing acts on the wrong duplicate.
+func (s *Server) findGroceryItem(ctx context.Context, req mcp.CallToolRequest) (*paprika.GroceryItem, *mcp.CallToolResult, error) {
+	uid, _ := req.Params.Arguments["uid"].(string)
+	uid = strings.TrimSpace(uid)
+	itemName, _ := req.Params.Arguments["item_name"].(string)
+	itemName = strings.TrimSpace(itemName)
+	if uid == "" && itemName == "" {
+		return nil, nil, errors.New("uid or item_name is required")
+	}
+
+	groceryResp, err := s.paprika3.ListGroceries(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get grocery list: %w", err)
+	}
+
+	searchTerm := strings.ToLower(itemName)
+	var matched []paprika.GroceryItem
+	for _, item := range groceryResp.Result {
+		if item.Deleted {
+			continue
+		}
+		if uid != "" {
+			if item.UID == uid {
+				matched = append(matched, item)
+			}
+		} else if strings.Contains(strings.ToLower(item.Ingredient), searchTerm) ||
+			strings.Contains(strings.ToLower(item.Name), searchTerm) {
+			matched = append(matched, item)
+		}
+	}
+
+	switch len(matched) {
+	case 0:
+		target := itemName
+		if uid != "" {
+			target = uid
+		}
+		return nil, mcp.NewToolResultText(fmt.Sprintf("# No Items Found\n\nNo grocery items found matching \"%s\". Use list_groceries to see your current list.", target)), nil
+	case 1:
+		return &matched[0], nil, nil
+	}
+
+	lists, _, err := s.groceryListIndex(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var text strings.Builder
+	text.WriteString(fmt.Sprintf("# Multiple Items Match\n\n%d items match \"%s\". Nothing was changed; call again with the uid of the one you mean:\n\n", len(matched), itemName))
+	for _, item := range matched {
+		text.WriteString("- " + formatGroceryLine(item, lists) + "\n")
+	}
+	return nil, mcp.NewToolResultText(text.String()), nil
+}
+
 func (s *Server) removeGroceryItem(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
 
-	// Get item name parameter
-	itemName, ok := req.Params.Arguments["item_name"].(string)
-	if !ok || itemName == "" {
-		return nil, errors.New("item_name is required")
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	item, result, err := s.findGroceryItem(ctx, req)
+	if err != nil || result != nil {
+		return result, err
+	}
+
+	if err := s.paprika3.DeleteGroceryItem(ctx, item.UID); err != nil {
+		return nil, fmt.Errorf("failed to remove grocery item: %w", err)
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Removed grocery item", "ingredient", item.Ingredient, "uid", item.UID, "duration", duration)
+
+	return mcp.NewToolResultText(fmt.Sprintf("# Grocery Item Removed Successfully\n\nRemoved **%s** (uid: %s) from your grocery list.\n", item.Ingredient, item.UID)), nil
+}
+
+func (s *Server) setGroceryPurchased(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+
+	purchased := true
+	if val, ok := req.Params.Arguments["purchased"].(bool); ok {
+		purchased = val
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// Get current grocery list to find the item
-	groceryResp, err := s.paprika3.ListGroceries(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get grocery list: %w", err)
+	item, result, err := s.findGroceryItem(ctx, req)
+	if err != nil || result != nil {
+		return result, err
 	}
 
-	// Find matching items (case-insensitive search)
-	searchTerm := strings.ToLower(strings.TrimSpace(itemName))
-	var matchedItems []paprika.GroceryItem
-	for _, item := range groceryResp.Result {
-		if strings.Contains(strings.ToLower(item.Ingredient), searchTerm) ||
-			strings.Contains(strings.ToLower(item.Name), searchTerm) {
-			matchedItems = append(matchedItems, item)
-		}
-	}
-
-	if len(matchedItems) == 0 {
-		return mcp.NewToolResultText(fmt.Sprintf("# No Items Found\n\nNo grocery items found matching \"%s\". Use list_groceries to see your current list.", itemName)), nil
-	}
-
-	// If multiple matches, remove the first one but inform the user
-	itemToRemove := matchedItems[0]
-	err = s.paprika3.DeleteGroceryItem(ctx, itemToRemove.UID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to remove grocery item: %w", err)
+	// The sync endpoint replaces the whole record, so send the full item back.
+	updated := *item
+	updated.Purchased = purchased
+	if _, err := s.paprika3.SaveGroceryItem(ctx, updated); err != nil {
+		return nil, fmt.Errorf("failed to update grocery item: %w", err)
 	}
 
 	duration := time.Since(start)
-	s.logger.Info("Removed grocery item", "ingredient", itemToRemove.Ingredient, "uid", itemToRemove.UID, "duration", duration)
+	s.logger.Info("Set grocery item purchased", "ingredient", item.Ingredient, "uid", item.UID, "purchased", purchased, "duration", duration)
 
-	// Format result
-	var resultText strings.Builder
-	resultText.WriteString("# Grocery Item Removed Successfully\n\n")
-	resultText.WriteString(fmt.Sprintf("Removed **%s** from your grocery list.\n\n", itemToRemove.Ingredient))
-
-	if len(matchedItems) > 1 {
-		resultText.WriteString(fmt.Sprintf("Note: Found %d items matching \"%s\". Removed the first match:\n", len(matchedItems), itemName))
-		for i, item := range matchedItems {
-			status := "❌ REMOVED"
-			if i > 0 {
-				status = "⚠️  Still in list"
-			}
-			resultText.WriteString(fmt.Sprintf("- %s %s", status, item.Ingredient))
-			if item.Quantity != "" {
-				resultText.WriteString(fmt.Sprintf(" (%s)", item.Quantity))
-			}
-			resultText.WriteString("\n")
-		}
-		resultText.WriteString("\nTo remove additional items, run the command again.\n")
-	} else {
-		resultText.WriteString("The item has been removed from your Paprika grocery list.\n")
+	state := "purchased"
+	if !purchased {
+		state = "not purchased"
 	}
+	return mcp.NewToolResultText(fmt.Sprintf("# Grocery Item Updated\n\nMarked **%s** (uid: %s) as %s.\n", item.Ingredient, item.UID, state)), nil
+}
 
-	return mcp.NewToolResultText(resultText.String()), nil
+// groceryListIndex returns the account's live grocery lists keyed by UID, and
+// the default list's UID.
+func (s *Server) groceryListIndex(ctx context.Context) (map[string]paprika.GroceryList, string, error) {
+	resp, err := s.paprika3.ListGroceryLists(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get grocery lists: %w", err)
+	}
+	lists := make(map[string]paprika.GroceryList)
+	defaultUID := ""
+	for _, l := range resp.Result {
+		if l.Deleted {
+			continue
+		}
+		lists[l.UID] = l
+		if l.IsDefault {
+			defaultUID = l.UID
+		}
+	}
+	return lists, defaultUID, nil
+}
+
+// formatGroceryLine renders one item with its list name and UID, labeling
+// items whose list_uid matches no live list as orphaned.
+func formatGroceryLine(item paprika.GroceryItem, lists map[string]paprika.GroceryList) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("**%s**", item.Ingredient))
+	if item.Quantity != "" {
+		b.WriteString(fmt.Sprintf(" (%s)", item.Quantity))
+	}
+	if item.Recipe != "" {
+		b.WriteString(fmt.Sprintf(" - for %s", item.Recipe))
+	}
+	if item.Instruction != "" {
+		b.WriteString(fmt.Sprintf(" _%s_", item.Instruction))
+	}
+	listName := "(none — orphaned)"
+	if l, ok := lists[item.ListUID]; ok {
+		listName = l.Name
+	}
+	b.WriteString(fmt.Sprintf(" — list: %s · uid: %s", listName, item.UID))
+	return b.String()
 }
 
 func (s *Server) getRecipe(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1048,16 +1146,54 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	listSel, _ := req.Params.Arguments["list"].(string)
+	listSel = strings.TrimSpace(listSel)
+	includeOrphans, _ := req.Params.Arguments["include_orphans"].(bool)
+
+	lists, defaultUID, err := s.groceryListIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve which list to show: the default list, a list by name/UID, or all.
+	allLists := strings.EqualFold(listSel, "all")
+	targetUID := defaultUID
+	switch {
+	case allLists:
+		targetUID = ""
+		includeOrphans = true
+	case listSel != "":
+		targetUID = ""
+		for uid, l := range lists {
+			if uid == listSel || strings.EqualFold(l.Name, listSel) {
+				targetUID = uid
+				break
+			}
+		}
+		if targetUID == "" {
+			return nil, fmt.Errorf("no grocery list named or with UID %q; call list_grocery_lists", listSel)
+		}
+	case targetUID == "":
+		return nil, errors.New("no default grocery list found; pass list explicitly")
+	}
+
 	// Get groceries from Paprika
 	groceryResp, err := s.paprika3.ListGroceries(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get groceries: %w", err)
 	}
 
-	// Filter items based on purchase status, excluding deleted items
+	// Filter items by list and purchase status, excluding deleted items
 	var filteredItems []paprika.GroceryItem
 	for _, item := range groceryResp.Result {
 		if item.Deleted {
+			continue
+		}
+		if _, onLiveList := lists[item.ListUID]; !onLiveList {
+			if !includeOrphans {
+				continue
+			}
+		} else if !allLists && item.ListUID != targetUID {
 			continue
 		}
 		switch filter {
@@ -1079,7 +1215,11 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	// Format results
 	var resultText strings.Builder
-	resultText.WriteString("# Grocery List\n\n")
+	if allLists {
+		resultText.WriteString("# Grocery List: all lists\n\n")
+	} else {
+		resultText.WriteString(fmt.Sprintf("# Grocery List: %s\n\n", lists[targetUID].Name))
+	}
 
 	if len(filteredItems) == 0 {
 		resultText.WriteString("No grocery items found.\n")
@@ -1113,17 +1253,7 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 					status = "☑"
 				}
 
-				resultText.WriteString(fmt.Sprintf("%s **%s**", status, item.Ingredient))
-				if item.Quantity != "" {
-					resultText.WriteString(fmt.Sprintf(" (%s)", item.Quantity))
-				}
-				if item.Recipe != "" {
-					resultText.WriteString(fmt.Sprintf(" - for %s", item.Recipe))
-				}
-				if item.Instruction != "" {
-					resultText.WriteString(fmt.Sprintf(" _%s_", item.Instruction))
-				}
-				resultText.WriteString("\n")
+				resultText.WriteString(fmt.Sprintf("%s %s\n", status, formatGroceryLine(item, lists)))
 			}
 			resultText.WriteString("\n")
 		}
